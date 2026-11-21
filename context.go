@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -101,23 +102,55 @@ type sshContext struct {
 
 	values   map[interface{}]interface{}
 	valuesMu sync.Mutex
+
+	// generation is the connection-level epoch this context belongs to. Every
+	// connection gets a fresh, strictly increasing value; sessions and
+	// forwarding registrations inherit it from the context they run under.
+	// Cleanup paths compare it so that a late event from an older connection
+	// cannot tear down state owned by a newer one.
+	generation uint64
 }
 
 var _ context.Context = &sshContext{}
 
 var _ sync.Locker = &sshContext{}
 
+// fallbackGeneration is used for contexts created without a Server (mostly
+// tests). It keeps generations unique even then, which is what the ownership
+// checks rely on.
+var fallbackGeneration atomic.Uint64
+
+func nextContextGeneration(srv *Server) uint64 {
+	if srv != nil {
+		return srv.nextGeneration()
+	}
+	return fallbackGeneration.Add(1)
+}
+
 func newContext(srv *Server) (*sshContext, context.CancelFunc) {
 	innerCtx, cancel := context.WithCancel(context.Background())
 	ctx := &sshContext{
-		Context: innerCtx,
-		Mutex:   &sync.Mutex{},
-		values:  make(map[interface{}]interface{}),
+		Context:    innerCtx,
+		Mutex:      &sync.Mutex{},
+		values:     make(map[interface{}]interface{}),
+		generation: nextContextGeneration(srv),
 	}
 	ctx.SetValue(ContextKeyServer, srv)
 	perms := &Permissions{&gossh.Permissions{}}
 	ctx.SetValue(ContextKeyPermissions, perms)
 	return ctx, cancel
+}
+
+// contextGeneration returns the connection-level generation of ctx. Contexts
+// that did not originate from this package have no generation and report 0.
+func contextGeneration(ctx Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	if c, ok := ctx.(*sshContext); ok {
+		return c.generation
+	}
+	return 0
 }
 
 func resetPermissions(ctx Context) {

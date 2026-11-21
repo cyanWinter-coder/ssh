@@ -20,6 +20,50 @@ import (
 // and ListenAndServeTLS methods after a call to Shutdown or Close.
 var ErrServerClosed = errors.New("ssh: Server closed")
 
+// ErrServerShuttingDown is returned to work that arrives after Shutdown or
+// Close has begun: new handshakes and new forwarding registrations are refused
+// so that the drain has a bounded, definite set of sessions to wait for.
+var ErrServerShuttingDown = errors.New("ssh: server is shutting down")
+
+// forceCloseGrace bounds how long Shutdown waits for force-closed connections
+// to unwind after its context expired. The caller already gave up waiting, so
+// this only exists to return with teardown underway rather than mid-flight.
+const forceCloseGrace = time.Second
+
+// closedChan returns a channel that is already closed, so a wait on it returns
+// immediately.
+func closedChan() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// ShutdownError is returned by Server.Shutdown when the context expired before
+// every active session finished. The remaining sessions were force-closed;
+// Residual reports how many were still active when the deadline was reached.
+type ShutdownError struct {
+	// Residual is the number of sessions still active at the deadline.
+	Residual int
+	// Connections is the number of connections still open at the deadline.
+	Connections int
+	// Forwards is the number of reverse-forward listeners still registered at
+	// the deadline.
+	Forwards int
+	// Err is the reason the drain stopped, normally context.DeadlineExceeded.
+	Err error
+}
+
+func (e *ShutdownError) Error() string {
+	return fmt.Sprintf("ssh: shutdown did not complete with %d session(s), %d connection(s), and %d forward(s) remaining: %v",
+		e.Residual, e.Connections, e.Forwards, e.Err)
+}
+
+// Unwrap exposes the context error so errors.Is(err, context.DeadlineExceeded)
+// keeps working for callers that used to compare Shutdown's result directly.
+func (e *ShutdownError) Unwrap() error {
+	return e.Err
+}
+
 // SubsystemHandler is a handler for a given SSH subsystem.
 type SubsystemHandler func(s Session)
 
@@ -101,10 +145,159 @@ type Server struct {
 	listenerWg sync.WaitGroup
 	mu         sync.RWMutex
 	started    atomic.Bool
+	draining   atomic.Bool
+	generation atomic.Uint64
 	listeners  map[net.Listener]struct{}
-	conns      map[*gossh.ServerConn]struct{}
-	connWg     sync.WaitGroup
-	doneChan   chan struct{}
+	conns      map[net.Conn]struct{}
+	sessions   map[*session]struct{}
+	forwards   map[*forwardEntry]struct{}
+	// sessionsDrained is closed when the last tracked session ends. It is
+	// created when the first session registers and replaced after each drain,
+	// so Shutdown can wait for the set it observed to become empty.
+	sessionsDrained chan struct{}
+	connWg          sync.WaitGroup
+	doneChan        chan struct{}
+}
+
+// nextGeneration returns a new monotonic connection generation. Generations
+// are server-scoped so that they order every connection the server serves.
+func (srv *Server) nextGeneration() uint64 {
+	return srv.generation.Add(1)
+}
+
+// isShuttingDown reports whether Close or Shutdown has begun. New handshakes
+// and new forwarding registrations are refused while it is true.
+func (srv *Server) isShuttingDown() bool {
+	return srv.draining.Load()
+}
+
+// trackConn records a connection for as long as handleConn is serving it,
+// including before the handshake completes. Tracking it from the start means
+// Shutdown can force-close a connection that is stuck in a handshake instead
+// of waiting on it, and that a connection racing with Shutdown is either
+// refused or observed. Adding returns false when the server is already
+// draining, in which case the caller must not serve the connection. Removing
+// is idempotent.
+func (srv *Server) trackConn(c net.Conn, add bool) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if srv.conns == nil {
+		srv.conns = make(map[net.Conn]struct{})
+	}
+	if add {
+		if srv.draining.Load() {
+			return false
+		}
+		srv.conns[c] = struct{}{}
+		srv.connWg.Add(1)
+		return true
+	}
+	if _, ok := srv.conns[c]; !ok {
+		return true
+	}
+	delete(srv.conns, c)
+	srv.connWg.Done()
+	return true
+}
+
+// trackSession registers sess as active. It returns false when the server is
+// shutting down, which keeps the set Shutdown waits for closed: once the
+// draining flag is set, no new session can join it. Unregistering is
+// idempotent, so a late cleanup from a session that already ended cannot
+// signal the drain twice.
+func (srv *Server) trackSession(sess *session, add bool) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if srv.sessions == nil {
+		srv.sessions = make(map[*session]struct{})
+	}
+	if add {
+		if srv.draining.Load() {
+			return false
+		}
+		if len(srv.sessions) == 0 && srv.sessionsDrained == nil {
+			srv.sessionsDrained = make(chan struct{})
+		}
+		srv.sessions[sess] = struct{}{}
+		return true
+	}
+	if _, ok := srv.sessions[sess]; !ok {
+		return true
+	}
+	delete(srv.sessions, sess)
+	if len(srv.sessions) == 0 && srv.sessionsDrained != nil {
+		close(srv.sessionsDrained)
+		srv.sessionsDrained = nil
+	}
+	return true
+}
+
+// closeTrackedConns closes every connection handleConn is currently serving,
+// including ones that have not finished their handshake. It returns how many
+// were closed. New connections are refused while draining, so this set does
+// not grow after the snapshot.
+func (srv *Server) closeTrackedConns() int {
+	srv.mu.Lock()
+	conns := make([]net.Conn, 0, len(srv.conns))
+	for c := range srv.conns {
+		conns = append(conns, c)
+	}
+	srv.mu.Unlock()
+
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	// Reverse-forward listeners belong to connections, so tearing down the
+	// connections without their listeners would leave the bound addresses
+	// occupied. Close them here; each removal is idempotent. Only connections
+	// are counted in the return value.
+	srv.closeTrackedForwards()
+	return len(conns)
+}
+
+// trackForward registers a reverse-forward listener with the server so that
+// Close can tear it down. Registration fails once draining has begun, under
+// the same lock that guards the drain decision, so a forward racing with
+// Shutdown cannot be created after the server stopped accepting work.
+func (srv *Server) trackForward(entry *forwardEntry, add bool) bool {
+	if entry == nil {
+		return true
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if srv.forwards == nil {
+		srv.forwards = make(map[*forwardEntry]struct{})
+	}
+	if add {
+		if srv.draining.Load() {
+			return false
+		}
+		srv.forwards[entry] = struct{}{}
+		return true
+	}
+	delete(srv.forwards, entry)
+	return true
+}
+
+// closeTrackedForwards force-closes every reverse-forward listener still
+// registered. It returns how many it closed.
+func (srv *Server) closeTrackedForwards() int {
+	srv.mu.Lock()
+	entries := make([]*forwardEntry, 0, len(srv.forwards))
+	for entry := range srv.forwards {
+		entries = append(entries, entry)
+		delete(srv.forwards, entry)
+	}
+	srv.mu.Unlock()
+
+	for _, entry := range entries {
+		entry.stop()
+		_ = entry.close()
+	}
+	return len(entries)
 }
 
 func (srv *Server) ensureHostSigner() error {
@@ -243,44 +436,98 @@ func (srv *Server) Handle(fn Handler) {
 }
 
 // Close immediately closes all active listeners and all active
-// connections.
+// connections. New handshakes and forwarding registrations are refused once
+// Close has begun.
 //
 // Close returns any error returned from closing the Server's
 // underlying Listener(s).
 func (srv *Server) Close() error {
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
+	// Stop accepting new work under the same lock connection and session
+	// registration use, so everything closed below is the whole set and
+	// nothing can join it afterwards.
+	srv.draining.Store(true)
 	srv.closeDoneChanLocked()
 	err := srv.closeListenersLocked()
-	for c := range srv.conns {
-		_ = c.Close()
-		delete(srv.conns, c)
-	}
+	srv.mu.Unlock()
+
+	srv.closeTrackedConns()
 	return err
 }
 
 // Shutdown gracefully shuts down the server without interrupting any
-// active connections. Shutdown works by first closing all open
-// listeners, and then waiting indefinitely for connections to close.
-// If the provided context expires before the shutdown is complete,
-// then the context's error is returned.
+// active connections. Shutdown works by first refusing new handshakes and
+// forwarding registrations, closing all open listeners, and then waiting for
+// the sessions that were active when it started to finish.
+//
+// If the provided context expires before the shutdown is complete, the
+// remaining sessions, connections, and forward listeners are force-closed and
+// a *ShutdownError is returned that reports how many were still active. The
+// error wraps the context error, so errors.Is(err, context.DeadlineExceeded)
+// still holds.
 func (srv *Server) Shutdown(ctx context.Context) error {
 	srv.mu.Lock()
+	// Refuse new handshakes and forwarding under the registration lock, so the
+	// session and connection sets snapshotted below are final. Anything that
+	// registered before this point has already completed its WaitGroup Add;
+	// anything after it is refused.
+	srv.draining.Store(true)
 	lnerr := srv.closeListenersLocked()
 	srv.closeDoneChanLocked()
+	// Snapshot the wait gate for the sessions already active. trackSession
+	// closes it when the tracked set empties; if no session is active yet the
+	// gate is nil and that state is already drained.
+	drained := srv.sessionsDrained
+	if drained == nil {
+		drained = closedChan()
+	}
+	connWg := &srv.connWg
 	srv.mu.Unlock()
 
 	finished := make(chan struct{}, 1)
 	go func() {
 		srv.listenerWg.Wait()
-		srv.connWg.Wait()
+		// Wait for the sessions that were active when Shutdown started.
+		// Connections that never carried a session must not keep the drain
+		// open: a client can hold an idle connection indefinitely.
+		<-drained
+		// No new session can register now, so every remaining connection is
+		// either idle or still handshaking. Close them and wait for their
+		// goroutines to unwind.
+		srv.closeTrackedConns()
+		connWg.Wait()
 		finished <- struct{}{}
 	}()
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		srv.mu.RLock()
+		residualSessions := len(srv.sessions)
+		residualConns := len(srv.conns)
+		residualForwards := len(srv.forwards)
+		srv.mu.RUnlock()
+
+		// Force-close what is left, including the forward listeners, so no
+		// bound address outlives the shutdown. The counts were taken before
+		// closing because they are this call's report, not a live reading.
+		srv.closeTrackedConns()
+
+		unwound := make(chan struct{}, 1)
+		go func() {
+			connWg.Wait()
+			unwound <- struct{}{}
+		}()
+		select {
+		case <-unwound:
+		case <-time.After(forceCloseGrace):
+		}
+
+		return &ShutdownError{
+			Residual:    residualSessions,
+			Connections: residualConns,
+			Forwards:    residualForwards,
+			Err:         ctx.Err(),
+		}
 	case <-finished:
 		return lnerr
 	}
@@ -309,7 +556,9 @@ func (srv *Server) Serve(l net.Listener) error {
 	}
 	var tempDelay time.Duration
 
-	srv.trackListener(l, true)
+	if !srv.trackListener(l, true) {
+		return ErrServerClosed
+	}
 	srv.started.Store(true)
 	defer srv.trackListener(l, false)
 	for {
@@ -397,6 +646,10 @@ func remoteAddrString(conn net.Conn) string {
 }
 
 func (srv *Server) handleConn(newConn net.Conn) {
+	// A new handshake always starts from a brand-new context with its own
+	// generation. Nothing authentication-related survives from a previous
+	// connection: no user, public key, permissions, or agent-request state has
+	// a place to live outside this context.
 	ctx, cancel := newContext(srv)
 	if srv.ConnCallback != nil {
 		cbConn := srv.ConnCallback(ctx, newConn)
@@ -418,6 +671,16 @@ func (srv *Server) handleConn(newConn net.Conn) {
 		conn.setHandshakeDeadline(time.Now().Add(srv.HandshakeTimeout))
 	}
 	conn.updateDeadline()
+
+	// Refuse the handshake outright once draining has begun. Tracking happens
+	// under the same lock that Shutdown uses to take its snapshot, so a
+	// connection either registers before the drain starts and is waited for /
+	// force-closed, or is turned away here.
+	if !srv.trackConn(conn, true) {
+		_ = conn.Close()
+		return
+	}
+	defer srv.trackConn(conn, false)
 	defer func() { _ = conn.Close() }()
 	defer func() {
 		if srv.ConnectionCloseCallback != nil {
@@ -444,9 +707,6 @@ func (srv *Server) handleConn(newConn net.Conn) {
 	// permissions off of the gossh.Conn and re-attach them to the Permissions
 	// object stored in the Context.
 	ctx.Permissions().Permissions = sshConn.Permissions
-
-	srv.trackConn(sshConn, true)
-	defer srv.trackConn(sshConn, false)
 
 	ctx.SetValue(ContextKeyConn, sshConn)
 	applyConnMetadata(ctx, sshConn)
@@ -581,7 +841,10 @@ func (srv *Server) closeListenersLocked() error {
 	return err
 }
 
-func (srv *Server) trackListener(ln net.Listener, add bool) {
+// trackListener registers ln so Shutdown and Close can close it. Adding fails
+// once the server is draining: a Serve that races with Shutdown must not keep
+// accepting connections after the drain started.
+func (srv *Server) trackListener(ln net.Listener, add bool) bool {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
@@ -589,33 +852,20 @@ func (srv *Server) trackListener(ln net.Listener, add bool) {
 		srv.listeners = make(map[net.Listener]struct{})
 	}
 	if add {
-		// If the *Server is being reused after a previous
-		// Close or Shutdown, reset its doneChan:
-		if len(srv.listeners) == 0 && len(srv.conns) == 0 {
-			srv.doneChan = nil
+		if srv.draining.Load() {
+			return false
 		}
 		srv.listeners[ln] = struct{}{}
 		srv.listenerWg.Add(1)
-	} else {
-		delete(srv.listeners, ln)
-		srv.listenerWg.Done()
+		return true
 	}
-}
-
-func (srv *Server) trackConn(c *gossh.ServerConn, add bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	if srv.conns == nil {
-		srv.conns = make(map[*gossh.ServerConn]struct{})
-	}
-	if add {
-		srv.conns[c] = struct{}{}
-		srv.connWg.Add(1)
-	} else {
-		delete(srv.conns, c)
-		srv.connWg.Done()
-	}
+	// The listener is always removed from the set by whoever closes it, so the
+	// delete below may be a no-op. The Done must still run: Serve calls this
+	// exactly once when it returns, and closeListenersLocked never touches the
+	// WaitGroup.
+	delete(srv.listeners, ln)
+	srv.listenerWg.Done()
+	return true
 }
 
 // extractPublicKeyFromPermissions re-parses the public key from the

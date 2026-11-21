@@ -108,7 +108,18 @@ func DefaultSessionHandler(srv *Server, conn *gossh.ServerConn, newChan gossh.Ne
 		sessReqCb:         srv.SessionRequestCallback,
 		subsystemHandlers: srv.SubsystemHandlers,
 		ctx:               ctx,
+		generation:        contextGeneration(ctx),
+		closeChannel:      closeOnce(ch),
 	}
+	// Register the session before anything can run under it. A session that
+	// arrives while the server is draining is refused outright rather than
+	// accepted into a set Shutdown no longer waits for.
+	if !srv.trackSession(sess, true) {
+		_ = sess.closeChannel()
+		return
+	}
+	defer srv.trackSession(sess, false)
+
 	ctx.SetValue(ContextKeySession, sess)
 	sess.handleRequests(reqs)
 }
@@ -122,6 +133,7 @@ type session struct {
 	handled           bool
 	exited            bool
 	pty               *Pty
+	ptyClose          func() error
 	winch             chan Window
 	env               []string
 	ptyCb             PtyCallback
@@ -133,6 +145,18 @@ type session struct {
 	sigCh             chan<- Signal
 	sigBuf            []Signal
 	breakCh           chan<- bool
+	// generation is the connection generation the session was created under.
+	// It ties every session to the handshake that admitted it, so diagnostics
+	// and ownership checks can tell which connection an event belongs to.
+	generation uint64
+	// closeChannel closes the underlying channel at most once. The request
+	// loop, Exit, and the proxy copy goroutines can all observe the end of a
+	// session, so teardown is funnelled through it.
+	closeChannel func() error
+	// agentRequested is session-scoped: it starts false for every session, so
+	// a client cannot inherit an agent request from a previous connection or
+	// even a previous session on the same connection.
+	agentRequested bool
 }
 
 func (sess *session) Stderr() io.ReadWriter {
@@ -170,11 +194,12 @@ func (sess *session) Context() Context {
 
 func (sess *session) Exit(code int) error {
 	sess.Lock()
-	defer sess.Unlock()
 	if sess.exited {
+		sess.Unlock()
 		return errors.New("Session.Exit called multiple times")
 	}
 	sess.exited = true
+	sess.Unlock()
 
 	status := struct{ Status uint32 }{uint32(code)}
 	_, err := sess.SendRequest("exit-status", false, gossh.Marshal(&status))
@@ -182,6 +207,17 @@ func (sess *session) Exit(code int) error {
 		return err
 	}
 	return sess.Close()
+}
+
+// Close closes the session's channel exactly once. Callers that race on the
+// end of a session (the handler, the request loop, the copy goroutines) all
+// funnel here, so repeated closes are idempotent and never report an error for
+// an already-released channel.
+func (sess *session) Close() error {
+	if sess.closeChannel != nil {
+		return sess.closeChannel()
+	}
+	return sess.Channel.Close()
 }
 
 func (sess *session) User() string {
@@ -218,6 +254,8 @@ func (sess *session) EmulatedPty() bool {
 }
 
 func (sess *session) Pty() (Pty, <-chan Window, bool) {
+	sess.Lock()
+	defer sess.Unlock()
 	if sess.pty != nil && (sess.EmulatedPty() || !sess.pty.IsZero()) {
 		return *sess.pty, sess.winch, true
 	}
@@ -229,9 +267,11 @@ func (sess *session) Signals(c chan<- Signal) {
 	defer sess.Unlock()
 	sess.sigCh = c
 	if len(sess.sigBuf) > 0 {
+		buf := sess.sigBuf
+		sess.sigBuf = nil
 		go func() {
-			for _, sig := range sess.sigBuf {
-				sess.sigCh <- sig
+			for _, sig := range buf {
+				c <- sig
 			}
 		}()
 	}
@@ -247,7 +287,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 	for req := range reqs {
 		switch req.Type {
 		case "shell", "exec":
-			if sess.handled {
+			if sess.isHandled() {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -269,33 +309,36 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 
-			sess.handled = true
+			sess.setHandled()
 			_ = req.Reply(true, nil)
 
+			pty := sess.allocatedPty()
 			go func() {
 				// Closed from a defer so the pty is still released when the
-				// handler panics, rather than trading a crash for a leak.
-				if sess.pty != nil && !sess.pty.IsZero() {
-					defer func() { _ = sess.pty.Close() }()
+				// handler panics, rather than trading a crash for a leak. The
+				// close is the session's shared once wrapper, so the request
+				// loop's own cleanup cannot close it a second time.
+				if pty != nil {
+					defer func() { _ = sess.closePty() }()
 				}
 				defer recoverAndLog("panic in session handler", nil, func() {
 					_ = sess.Exit(1)
 				})
-				if sess.pty != nil && !sess.pty.IsZero() {
+				if pty != nil {
 					go func() {
 						defer recoverAndLog("panic copying to pty", nil, nil)
-						_, _ = io.Copy(sess.pty, sess)
+						_, _ = io.Copy(pty, sess)
 					}()
 					go func() {
 						defer recoverAndLog("panic copying from pty", nil, nil)
-						_, _ = io.Copy(sess, sess.pty)
+						_, _ = io.Copy(sess, pty)
 					}()
 				}
 				sess.handler(sess)
 				_ = sess.Exit(0)
 			}()
 		case "subsystem":
-			if sess.handled {
+			if sess.isHandled() {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -321,7 +364,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				continue
 			}
 
-			sess.handled = true
+			sess.setHandled()
 			_ = req.Reply(true, nil)
 
 			go func() {
@@ -332,7 +375,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				_ = sess.Exit(0)
 			}()
 		case "env":
-			if sess.handled {
+			if sess.isHandled() {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -353,7 +396,7 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 			}
 			sess.Unlock()
 		case "pty-req":
-			if sess.handled || sess.pty != nil {
+			if sess.isHandled() || sess.hasPty() {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -370,9 +413,16 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				}
 			}
 
+			sess.Lock()
 			sess.pty = &ptyReq
 			sess.winch = make(chan Window, 1)
-			sess.winch <- ptyReq.Window
+			winch := sess.winch
+			sess.Unlock()
+			winch <- ptyReq.Window
+			// The winch channel is closed by the deferred cleanup below, which
+			// runs when the request channel closes. It is never closed while
+			// the request loop may still send on it, so the window-change case
+			// can enqueue safely.
 
 			if sess.ptyHandler != nil {
 				closer, err := sess.ptyHandler(sess.ctx, sess, ptyReq)
@@ -381,13 +431,18 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 					_ = req.Reply(false, nil)
 					continue
 				}
+				if closer != nil {
+					// One shared closer for the request loop, the handler, and
+					// this defer, so the PTY is released exactly once no matter
+					// which of them gets there first.
+					sess.setPtyClose(closer)
+				}
 
-				defer func() { _ = closer() }() //nolint:staticcheck // intentional: runs when req channel closes
-
-				if !sess.EmulatedPty() && !sess.pty.IsZero() {
+				pty := sess.allocatedPty()
+				if !sess.EmulatedPty() && pty != nil {
 					go func() {
 						defer recoverAndLog("panic resizing pty", nil, nil)
-						for win := range sess.winch {
+						for win := range winch {
 							if err := resizePty(sess, win); err != nil {
 								// TODO: handle error
 								continue
@@ -397,24 +452,36 @@ func (sess *session) handleRequests(reqs <-chan *gossh.Request) {
 				}
 			}
 
-			defer func() { //nolint:staticcheck // intentional: runs when req channel closes
+			defer func() { //nolint:staticcheck // intentional: runs when reqs is closed
 				// when reqs is closed
-				close(sess.winch)
+				close(winch)
+				_ = sess.closePty()
 			}()
 			_ = req.Reply(ok, nil)
 		case "window-change":
-			if sess.pty == nil {
-				_ = req.Reply(false, nil)
-				continue
-			}
+			sess.Lock()
+			hasPty := sess.pty != nil
 			win, _, ok := parseWindow(req.Payload)
-			if ok {
+			if hasPty && ok {
 				sess.pty.Window = win
-				sess.winch <- win
 			}
-			_ = req.Reply(ok, nil)
+			winch := sess.winch
+			sess.Unlock()
+			// Sent outside the lock: winch has a capacity of one, so holding
+			// the lock across the send would let a slow consumer block every
+			// Pty() behind it.
+			if hasPty && ok {
+				winch <- win
+			}
+			_ = req.Reply(hasPty && ok, nil)
 		case agentRequestType:
-			// TODO: option/callback to allow agent forwarding
+			// TODO: option/callback to allow agent forwarding.
+			// Recorded on the session as well as the connection context: agent
+			// state is per-session, so an earlier session or connection can
+			// never make a later one report AgentRequested.
+			sess.Lock()
+			sess.agentRequested = true
+			sess.Unlock()
 			SetAgentRequested(sess.ctx)
 			_ = req.Reply(true, nil)
 		case "break":
@@ -439,20 +506,85 @@ func (sess *session) ptyAllocate(term string, win Window, modes gossh.TerminalMo
 		return nil, err
 	}
 
+	sess.Lock()
 	sess.pty = &Pty{
 		Term:   term,
 		Window: win,
 		Modes:  modes,
 		impl:   p,
 	}
+	sess.Unlock()
 
 	return p.Close, nil
 }
 
 func resizePty(sess *session, win Window) error {
-	if sess.pty == nil {
+	sess.Lock()
+	pty := sess.pty
+	sess.Unlock()
+	if pty == nil {
 		return nil
 	}
 
-	return sess.pty.Resize(win.Width, win.Height)
+	return pty.Resize(win.Width, win.Height)
 }
+
+// isHandled reports whether a shell, exec, or subsystem request has been
+// accepted. The request loop mutates it and the handler goroutine reads it, so
+// both sides take the lock.
+func (sess *session) isHandled() bool {
+	sess.Lock()
+	defer sess.Unlock()
+	return sess.handled
+}
+
+// setHandled marks the session as having accepted a shell, exec, or subsystem.
+func (sess *session) setHandled() {
+	sess.Lock()
+	sess.handled = true
+	sess.Unlock()
+}
+
+// hasPty reports whether a PTY request has already been accepted.
+func (sess *session) hasPty() bool {
+	sess.Lock()
+	defer sess.Unlock()
+	return sess.pty != nil
+}
+
+// allocatedPty returns the PTY this session allocated, or nil if it has none.
+func (sess *session) allocatedPty() *Pty {
+	sess.Lock()
+	defer sess.Unlock()
+	if sess.pty == nil || sess.pty.IsZero() {
+		return nil
+	}
+	return sess.pty
+}
+
+// setPtyClose installs the PTY's closer, wrapped so that every teardown path
+// (request loop, handler goroutine, panic recovery) releases it exactly once.
+func (sess *session) setPtyClose(closer func() error) {
+	sess.Lock()
+	defer sess.Unlock()
+	if sess.ptyClose == nil {
+		sess.ptyClose = closeOnce(closerFunc(closer))
+	}
+}
+
+// closePty releases the PTY allocated for this session, if any. It is safe to
+// call from several goroutines and more than once.
+func (sess *session) closePty() error {
+	sess.Lock()
+	closeFn := sess.ptyClose
+	sess.Unlock()
+	if closeFn == nil {
+		return nil
+	}
+	return closeFn()
+}
+
+// closerFunc adapts a plain close function to io.Closer for closeOnce.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
